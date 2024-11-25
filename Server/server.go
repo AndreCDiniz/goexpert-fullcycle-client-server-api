@@ -2,79 +2,138 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
-type CurrencyResponse struct {
-	USDBRL struct {
-		Bid string `json:"bid"`
-	} `json:"USDBRL"`
+type exchangeReqDTO struct {
+	Code        string `json:"code"`
+	Codein      string `json:"codein"`
+	Name        string `json:"name"`
+	High        string `json:"high"`
+	Low         string `json:"low"`
+	VarBid      string `json:"varBid"`
+	PctChange   string `json:"pctChange"`
+	Bid         string `json:"bid"`
+	Ask         string `json:"ask"`
+	Timestamp   string `json:"timestamp"`
+	Create_date string `json:"create_date"`
+	gorm.Model
+}
+
+type exchangeUsdbrl struct {
+	Usdbrl exchangeReqDTO `json:"usdbrl"`
+}
+
+type exchangeRespDTO struct {
+	Bid string `json:"bid"`
 }
 
 func main() {
-
-	db, err := sql.Open("sqlite", "cotacao.db")
-	if err != nil {
-		log.Fatalf("Erro ao conectar com o banco de dados: %v", err)
-	}
-	defer db.Close()
-
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS cotacoes (
-    		id INTEGER PRIMARY KEY AUTOINCREMENT,
-    		bid TEXT,
-    		timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`)
+	file, err := os.OpenFile("server.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.SetOutput(file)
+	log.Println("Log inicializado")
 
-	http.HandleFunc("/cotacao", func(w http.ResponseWriter, r *http.Request) {
-		ctxApi, cancelApi := context.WithTimeout(context.Background(), time.Millisecond*2000)
-		defer cancelApi()
+	http.HandleFunc("/cotacao", cotacaoHandler)
 
-		req, err := http.NewRequestWithContext(ctxApi, "GET", "https://economia.awesomeapi.com.br/json/last/USD-BRL", nil)
-		if err != nil {
-			log.Printf("Erro ao criar request: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+	err = http.ListenAndServe(":8080", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
 
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Printf("Erro ao fazer a requisição: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer resp.Body.Close()
+func cotacaoHandler(w http.ResponseWriter, r *http.Request) {
 
-		var CurrencyResponse CurrencyResponse
-		if err := json.NewDecoder(resp.Body).Decode(&CurrencyResponse); err != nil {
-			log.Printf("Erro ao decodificar a requisição: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+	log.Println("request /cotacao: iniciada")
+	defer log.Println("request /cotacao: finalizada")
 
-		ctxDb, cancelDb := context.WithTimeout(context.Background(), time.Millisecond*10)
-		defer cancelDb()
+	exchange, err := getDolarToReal()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(err.Error()))
+		log.Println("request /cotacao: erro na chamda externa")
+		return
+	}
 
-		_, err = db.ExecContext(ctxDb, "INSERT INTO cotacoes (bid) VALUES (?)", CurrencyResponse.USDBRL.Bid)
-		if err != nil {
-			log.Printf("Erro ao inserir no banco de dados: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+	err = insertExchange(exchange)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(err.Error()))
+		log.Println("request /cotacao: erro na chamada do banco de dados")
+		return
+	}
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"bid": CurrencyResponse.USDBRL.Bid})
-	})
+	var resp exchangeRespDTO
+	resp.Bid = exchange.Usdbrl.Bid
 
-	fmt.Println("Server is running at port 8282")
-	log.Fatal(http.ListenAndServe(":8282", nil))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
 
+	log.Println("request /cotacao: status code 200")
+}
+
+func insertExchange(exch *exchangeUsdbrl) error {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	// inicialização do banco de dados
+	db, err := gorm.Open(sqlite.Open("server.db"), &gorm.Config{})
+	if err != nil {
+		return err
+	}
+
+	err = db.AutoMigrate(&exchangeReqDTO{})
+	if err != nil {
+		return err
+	}
+
+	result := db.WithContext(ctx).Create(&exch.Usdbrl)
+	if result.Error != nil {
+		return result.Error
+	}
+
+	return nil
+}
+
+// Recupera as informações da cotação do Dolar para o Real
+func getDolarToReal() (*exchangeUsdbrl, error) {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://economia.awesomeapi.com.br/json/last/USD-BRL", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	client := http.DefaultClient
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var c exchangeUsdbrl
+	err = json.Unmarshal(body, &c)
+	if err != nil {
+		return nil, err
+	}
+
+	return &c, nil
 }
